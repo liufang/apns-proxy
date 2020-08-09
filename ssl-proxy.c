@@ -219,6 +219,7 @@ eventcb2(struct bufferevent *bev, short what, void *ctx)
             wb->data = NULL;
         };
         free(wb);
+		poolSocket->count--;
     } else if(what & BEV_EVENT_CONNECTED) {
         serverWriteCallback(bev, ctx);
     } else if(what & BEV_EVENT_TIMEOUT) {
@@ -287,6 +288,8 @@ accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
 
     //检查初始化服务器端连接池, 当前连接小于最大连接的时候就创建连接
     if(poolSocket->count < poolSocket->max) {
+		poolSocket->count++;
+
         b_out = bufferevent_openssl_socket_new(base, -1, ssl,
                                                BUFFEREVENT_SSL_CONNECTING,
                                                BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
