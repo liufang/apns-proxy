@@ -31,3 +31,7 @@
 # Debug files
 *.dSYM/
 *.su
+
+ssl-proxy
+.idea/
+cmake-build-debug/

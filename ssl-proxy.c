@@ -33,6 +33,8 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include "adlist.h"
+#include "request.h"
 
 static struct event_base *base;
 static struct sockaddr_storage listen_on_addr;
@@ -40,13 +42,63 @@ static struct sockaddr_storage connect_to_addr;
 static int connect_to_addrlen;
 static int server_mode = 0;
 static const char *program_name = NULL;
+static list* dataList;
+static poolSockets* poolSocket;
 
 static SSL_CTX *ssl_ctx = NULL;
 
 #define MAX_OUTPUT (512*1024)
 
+//static void clientReadCallback(struct bufferevent *bev, void *ctx);
 static void drained_writecb(struct bufferevent *bev, void *ctx);
 static void eventcb(struct bufferevent *bev, short what, void *ctx);
+static void serverWriteCallback(struct bufferevent *bev, void *ctx);
+
+//reset request
+static void resetRequest(request *r)
+{
+    r->data = malloc(sizeof(char) * 1024 * 5);
+    r->len = r->needLen = 0;
+}
+
+//解决黏包,循环读取消息内容插入队列
+static void
+clientReadCallback(struct bufferevent *bev, void *ctx)
+{
+    request *r = ctx;
+    struct evbuffer *src;
+    size_t len;
+    src = bufferevent_get_input(bev);
+
+    do {
+        len = evbuffer_get_length(src);
+        if(len<1) break;
+        //解决黏包问题确定读取长度
+        size_t n = 0;
+        if(r->needLen > 0) {
+            n = r->needLen - r->len;
+        } else {
+            n = 37 - r->len;
+        }
+        len = bufferevent_read(bev, (r->data + r->len), n);
+        r->len += len;
+        //头部最少长度
+        if(r->len >= 37 && r->needLen == 0) {
+            //检查设置数据长度
+            char *tmp = (char*)r->data;
+            r->needLen = 37 + (uint16_t)(tmp[35] <<8 | tmp[36]);
+        }
+        //检查是否完成读取操作
+        if(r->needLen == r->len) {
+            listAddNodeHead(dataList, r->data);
+            r->data = NULL;
+            r->len = 0;
+            r->needLen = 0;
+            //完成当前消息读取,为下一次消息读取做准备,复位 request
+            resetRequest(r);
+        }
+    } while(1);
+}
 
 static void
 readcb(struct bufferevent *bev, void *ctx)
@@ -75,6 +127,58 @@ readcb(struct bufferevent *bev, void *ctx)
 	}
 }
 
+/**
+ * 写回调
+ *
+ * @param bev
+ * @param ctx
+ */
+static void serverWriteCallback(struct bufferevent *bev, void *ctx)
+{
+    writeBuffer *wb = ctx;
+    listIter* iter = listGetIterator(dataList, AL_START_TAIL);
+    listNode* node;
+    size_t len = 0, dataLen = 0;
+    char *tmp;
+
+    do {
+        //读取buffer消息写
+        if(wb->totalLen > wb->writedLen) {
+            len = bufferevent_get_max_to_write(bev);
+            len = len < (wb->totalLen - wb->writedLen) ? len : wb->totalLen - wb->writedLen;
+            //写不了 推出
+            if(len < 1) {
+                return;
+            }
+
+            //足够空间写入
+            bufferevent_write(bev, (wb->data + wb->writedLen), len);
+            wb->writedLen += len;
+            //没写完返回
+            if(wb->totalLen > wb->writedLen) {
+                return;
+            }
+        }
+
+        //读取新消息写
+        if ((node = listNext(iter)) != NULL) {
+            tmp = (char*)node->value;
+            dataLen = 37 + (uint16_t)(tmp[35] <<8 | tmp[36]);
+            //free
+            if(wb->data) free(wb->data);
+            //从队列弹出数据到写缓存上下文
+            wb->data = node->value;
+            wb->totalLen = dataLen;
+            wb->writedLen = 0;
+            //free
+            listDelNode(dataList, node);
+            continue;
+        }
+        return;
+    } while(1);
+
+}
+
 static void
 drained_writecb(struct bufferevent *bev, void *ctx)
 {
@@ -88,21 +192,46 @@ drained_writecb(struct bufferevent *bev, void *ctx)
 		bufferevent_enable(partner, EV_READ);
 }
 
+//服务器端错误回调
 static void
-close_on_finished_writecb(struct bufferevent *bev, void *ctx)
+eventcb2(struct bufferevent *bev, short what, void *ctx)
 {
-	struct evbuffer *b = bufferevent_get_output(bev);
-
-	if (evbuffer_get_length(b) == 0) {
-		bufferevent_free(bev);
-	}
+    writeBuffer *wb = ctx;
+    if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
+        if (what & BEV_EVENT_ERROR) {
+            unsigned long err;
+            while ((err = (bufferevent_get_openssl_error(bev)))) {
+                const char *msg = (const char*)
+                        ERR_reason_error_string(err);
+                const char *lib = (const char*)
+                        ERR_lib_error_string(err);
+                const char *func = (const char*)
+                        ERR_func_error_string(err);
+                fprintf(stderr,
+                        "%s in %s %s\n", msg, lib, func);
+            }
+            if (errno)
+                perror("connection error");
+        }
+        bufferevent_free(bev);
+        if(wb->data) {
+            listAddNodeHead(dataList, wb->data);
+            wb->data = NULL;
+        };
+        free(wb);
+    } else if(what & BEV_EVENT_CONNECTED) {
+        serverWriteCallback(bev, ctx);
+    } else if(what & BEV_EVENT_TIMEOUT) {
+        //TODO 写超时
+    }
 }
 
+//客户端错误回调
 static void
 eventcb(struct bufferevent *bev, short what, void *ctx)
 {
-	struct bufferevent *partner = ctx;
-
+	request *r = ctx;
+    printf("------------error callback, error code: %d\r\n", what);
 	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
 		if (what & BEV_EVENT_ERROR) {
 			unsigned long err;
@@ -120,26 +249,9 @@ eventcb(struct bufferevent *bev, short what, void *ctx)
 				perror("connection error");
 		}
 
-		if (partner) {
-			/* Flush all pending data */
-			readcb(bev, ctx);
-
-			if (evbuffer_get_length(
-				    bufferevent_get_output(partner))) {
-				/* We still have to flush data from the other
-				 * side, but when that's done, close the other
-				 * side. */
-				bufferevent_setcb(partner,
-				    NULL, close_on_finished_writecb,
-				    eventcb, NULL);
-				bufferevent_disable(partner, EV_READ);
-			} else {
-				/* We have nothing left to say to the other
-				 * side; close it. */
-				bufferevent_free(partner);
-			}
-		}
 		bufferevent_free(bev);
+        if(r->data) free(r->data);
+        free(r);
 	}
 }
 
@@ -147,10 +259,9 @@ static void
 syntax(void)
 {
 	fputs("Syntax:\n", stderr);
-	fprintf(stderr, "   %s [-server -cert certificate_chain_file -key private_key_file] <listen-on-addr> <connect-to-addr>\n", program_name);
+	fprintf(stderr, "   %s [-cert certificate_chain_file -key private_key_file] <listen-on-addr> <connect-to-addr>\n", program_name);
 	fputs("Example:\n", stderr);
-	fprintf(stderr, "   %s -server -cert certificate_chain_file -key private_key_file 0.0.0.0:8443 127.0.0.1:8080\n", program_name);
-	fprintf(stderr, "   %s 127.0.0.1:8080 1.2.3.4:8443\n", program_name);
+	fprintf(stderr, "   %s -cert cer.pem -key private.key 0.0.0.0:8443 17.188.137.190:2195\n", program_name);
 
 	exit(1);
 }
@@ -162,36 +273,44 @@ accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	struct bufferevent *b_out, *b_in;
 	SSL *ssl = SSL_new(ssl_ctx);
 
-	/* Create two linked bufferevent objects: one to connect, one for the
-	 * new connection */
-	if (server_mode) {
-		b_in = bufferevent_openssl_socket_new(base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING,
-		    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-		b_out = bufferevent_socket_new(base, -1,
-		    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-	} else {
-		b_in = bufferevent_socket_new(base, fd,
-		    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-		b_out = bufferevent_openssl_socket_new(base, -1, ssl,
-		    BUFFEREVENT_SSL_CONNECTING,
-		    BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
-	}
+    b_in = bufferevent_socket_new(base, fd,
+        BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
 
-	assert(b_in && b_out);
+    //init request
+    request* r = malloc(sizeof(request));
+    resetRequest(r);
 
-	if (bufferevent_socket_connect(b_out,
-		(struct sockaddr*)&connect_to_addr, connect_to_addrlen)<0) {
-		perror("bufferevent_socket_connect");
-		bufferevent_free(b_out);
-		bufferevent_free(b_in);
-		return;
-	}
+	bufferevent_setcb(b_in, clientReadCallback, NULL, eventcb, r);
 
-	bufferevent_setcb(b_in, readcb, NULL, eventcb, b_out);
-	bufferevent_setcb(b_out, readcb, NULL, eventcb, b_in);
 
 	bufferevent_enable(b_in, EV_READ|EV_WRITE);
-	bufferevent_enable(b_out, EV_READ|EV_WRITE);
+
+
+    //检查初始化服务器端连接池, 当前连接小于最大连接的时候就创建连接
+    if(poolSocket->count < poolSocket->max) {
+        b_out = bufferevent_openssl_socket_new(base, -1, ssl,
+                                               BUFFEREVENT_SSL_CONNECTING,
+                                               BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
+
+        if (bufferevent_socket_connect(b_out,
+                                       (struct sockaddr*)&connect_to_addr, connect_to_addrlen)<0) {
+            perror("bufferevent_socket_connect");
+            bufferevent_free(b_out);
+            return;
+        }
+
+        //init write buffer
+        writeBuffer *wr = malloc(sizeof(writeBuffer));
+        wr->data = NULL;
+        wr->writedLen = 0;
+        wr->totalLen = 0;
+
+        bufferevent_setcb(b_out, NULL, serverWriteCallback, eventcb2, wr);
+        struct timeval tv = {1,0};
+        bufferevent_set_timeouts(b_out, NULL, &tv);
+        bufferevent_setwatermark(b_out, EV_WRITE, 0, 0);
+        bufferevent_enable(b_out, EV_WRITE);
+    }
 }
 
 static int
@@ -212,13 +331,19 @@ init_ssl(const char *certificate_chain_file, const char *private_key_file)
 	}
 	ssl_ctx = SSL_CTX_new(TLS_method());
 	SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv3);
-	if (server_mode) {
+
+	SSL_CTX_set_verify_depth(ssl_ctx, 1);
+	SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+	SSL_CTX_set_default_passwd_cb_userdata(ssl_ctx, (void*)"123456");
+
+//	if (server_mode) {
+
 		if (!SSL_CTX_use_certificate_chain_file(ssl_ctx, certificate_chain_file) ||
 			!SSL_CTX_use_PrivateKey_file(ssl_ctx, private_key_file, SSL_FILETYPE_PEM)) {
 			fprintf(stderr, "Couldn't read %s or %s.\n", certificate_chain_file, private_key_file);
 			return 2;
 		}
-	}
+//	}
 	return 0;
 }
 
@@ -266,6 +391,13 @@ main(int argc, char **argv)
 	if (i+2 != argc)
 		syntax();
 
+    //init data list
+    dataList = listCreate();
+    //init pool sockets
+    poolSocket = malloc(sizeof(poolSockets));
+    poolSocket->count = 0;
+    poolSocket->max = 10;
+
 	memset(&listen_on_addr, 0, sizeof(listen_on_addr));
 	socklen = sizeof(listen_on_addr);
 	if (evutil_parse_sockaddr_port(argv[i],
@@ -275,6 +407,7 @@ main(int argc, char **argv)
 		if (p < 1 || p > 65535)
 			syntax();
 		sin->sin_port = htons(p);
+		//这里需要设置正确的服务器地址
 		sin->sin_addr.s_addr = htonl(0x7f000001);
 		sin->sin_family = AF_INET;
 		socklen = sizeof(struct sockaddr_in);
