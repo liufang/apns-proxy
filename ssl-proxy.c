@@ -231,7 +231,6 @@ static void
 eventcb(struct bufferevent *bev, short what, void *ctx)
 {
 	request *r = ctx;
-    printf("------------error callback, error code: %d\r\n", what);
 	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
 		if (what & BEV_EVENT_ERROR) {
 			unsigned long err;
