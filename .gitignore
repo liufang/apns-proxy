@@ -32,6 +32,6 @@
 *.dSYM/
 *.su
 
-ssl-proxy
+apns-proxy
 .idea/
 cmake-build-debug/
