@@ -1,5 +1,5 @@
 # apns-proxy
-A simple SSL/TLS proxy using libevent.
+A apple apns proxy using libevent.
 
 This is a fork of [le-proxy.c](https://github.com/libevent/libevent/blob/master/sample/le-proxy.c)
 from [libevent](https://github.com/libevent/libevent).
@@ -16,4 +16,4 @@ Then just type `make` to build.
 
 # Usage
 
-/apns-proxy -cert xx.pem -key xx.pem 0.0.0.0:8443 17.188.129.31:2195
+./apns-proxy -cert xx.pem -key xx.pem 0.0.0.0:8443 17.188.129.31:2195

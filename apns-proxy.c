@@ -40,7 +40,6 @@ static struct event_base *base;
 static struct sockaddr_storage listen_on_addr;
 static struct sockaddr_storage connect_to_addr;
 static int connect_to_addrlen;
-static int server_mode = 0;
 static const char *program_name = NULL;
 static list* dataList;
 static poolSockets* poolSocket;
@@ -338,14 +337,11 @@ init_ssl(const char *certificate_chain_file, const char *private_key_file)
 	SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
 	SSL_CTX_set_default_passwd_cb_userdata(ssl_ctx, (void*)"123456");
 
-//	if (server_mode) {
-
-		if (!SSL_CTX_use_certificate_chain_file(ssl_ctx, certificate_chain_file) ||
-			!SSL_CTX_use_PrivateKey_file(ssl_ctx, private_key_file, SSL_FILETYPE_PEM)) {
-			fprintf(stderr, "Couldn't read %s or %s.\n", certificate_chain_file, private_key_file);
-			return 2;
-		}
-//	}
+	if (!SSL_CTX_use_certificate_chain_file(ssl_ctx, certificate_chain_file) ||
+		!SSL_CTX_use_PrivateKey_file(ssl_ctx, private_key_file, SSL_FILETYPE_PEM)) {
+		fprintf(stderr, "Couldn't read %s or %s.\n", certificate_chain_file, private_key_file);
+		return 2;
+	}
 	return 0;
 }
 
@@ -365,9 +361,7 @@ main(int argc, char **argv)
 		syntax();
 
 	for (i=1; i < argc; ++i) {
-		if (!strcmp(argv[i], "-server")) {
-			server_mode = 1;
-		} else if (!strcmp(argv[i], "-cert")) {
+		if (!strcmp(argv[i], "-cert")) {
 			if (i + 1 >= argc) {
 				syntax();
 			}
@@ -383,12 +377,6 @@ main(int argc, char **argv)
 			break;
 	}
 
-	if (server_mode) {
-		if (!certificate_chain_file || !private_key_file) {
-			fputs("Should specify certificate_chain_file and private_key_file when in server mode.\n", stderr);
-			return 1;
-		}
-	}
 
 	if (i+2 != argc)
 		syntax();
