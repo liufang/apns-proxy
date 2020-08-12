@@ -15,6 +15,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <syslog.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -35,6 +42,7 @@
 #include <openssl/rand.h>
 #include "adlist.h"
 #include "request.h"
+#include "simplog.h"
 
 static struct event_base *base;
 static struct sockaddr_storage listen_on_addr;
@@ -260,7 +268,7 @@ syntax(void)
 	fputs("Syntax:\n", stderr);
 	fprintf(stderr, "   %s [-cert certificate_chain_file -key private_key_file] <listen-on-addr> <connect-to-addr>\n", program_name);
 	fputs("Example:\n", stderr);
-	fprintf(stderr, "   %s -cert cer.pem -key private.key 0.0.0.0:8443 17.188.137.190:2195\n", program_name);
+	fprintf(stderr, "   %s -d -cert cer.pem -key private.key 0.0.0.0:8443 17.188.137.190:2195\n", program_name);
 
 	exit(1);
 }
@@ -345,11 +353,53 @@ init_ssl(const char *certificate_chain_file, const char *private_key_file)
 	return 0;
 }
 
+//init daemon
+int init_daemon(void)
+{
+	int pid;
+	int i;
+
+	//忽略终端I/O信号，STOP信号
+	signal(SIGTTOU,SIG_IGN);
+	signal(SIGTTIN,SIG_IGN);
+	signal(SIGTSTP,SIG_IGN);
+	signal(SIGHUP,SIG_IGN);
+
+	pid = fork();
+	if(pid > 0) {
+		exit(0); //结束父进程，使得子进程成为后台进程
+	}
+	else if(pid < 0) {
+		return -1;
+	}
+	//建立一个新的进程组,在这个新的进程组中,子进程成为这个进程组的首进程,以使该进程脱离所有终端
+	setsid();
+	//再次新建一个子进程，退出父进程，保证该进程不是进程组长，同时让该进程无法再打开一个新的终端
+	pid=fork();
+	if( pid > 0) {
+		exit(0);
+	}
+	else if( pid< 0) {
+		return -1;
+	}
+
+	//关闭所有从父进程继承的不再需要的文件描述符
+	for(i=0;i< NOFILE;close(i++));
+	//改变工作目录，使得进程不与任何文件系统联系
+	//chdir("/");
+	//将文件当时创建屏蔽字设置为0
+	umask(0);
+	//忽略SIGCHLD信号
+	signal(SIGCHLD,SIG_IGN);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
 	int i;
 	int socklen;
+    int daemon = 0;
 	const char *certificate_chain_file = NULL;
 	const char *private_key_file = NULL;
 
@@ -357,11 +407,16 @@ main(int argc, char **argv)
 
 	program_name = argv[0];
 
+    simplog.writeLog(SIMPLOG_INFO, "start apns proxy server");
+
 	if (argc < 3)
 		syntax();
 
 	for (i=1; i < argc; ++i) {
-		if (!strcmp(argv[i], "-cert")) {
+        if (!strcmp(argv[i], "-d")) {
+            //守护进程方式运行
+            daemon = 1;
+        } else if (!strcmp(argv[i], "-cert")) {
 			if (i + 1 >= argc) {
 				syntax();
 			}
@@ -380,6 +435,10 @@ main(int argc, char **argv)
 
 	if (i+2 != argc)
 		syntax();
+
+    if(daemon) {
+        init_daemon();
+    }
 
     //init data list
     dataList = listCreate();
