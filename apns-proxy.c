@@ -306,7 +306,7 @@ accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
         bufferevent_setcb(b_out, NULL, serverWriteCallback, eventcb2, wr);
         struct timeval tv = {1,0};
         bufferevent_set_timeouts(b_out, NULL, &tv);
-        bufferevent_setwatermark(b_out, EV_WRITE, 0, 0);
+        bufferevent_setwatermark(b_out, EV_WRITE|EV_PERSIST, 0, 0);
         bufferevent_enable(b_out, EV_WRITE);
     }
 }
