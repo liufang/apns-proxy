@@ -97,6 +97,7 @@ clientReadCallback(struct bufferevent *bev, void *ctx)
         }
         //检查是否完成读取操作
         if(r->needLen == r->len) {
+            simplog.writeLog(SIMPLOG_INFO, "push message to list, len: %d", r->needLen);
             listAddNodeHead(dataList, r->data);
             r->data = NULL;
             r->len = 0;
@@ -121,6 +122,8 @@ static void serverWriteCallback(struct bufferevent *bev, void *ctx)
     size_t len = 0, dataLen = 0;
     char *tmp;
 
+    simplog.writeLog(SIMPLOG_DEBUG, "start server write callback, %s", __func__);
+
     do {
         //读取buffer消息写
         if(wb->totalLen > wb->writedLen) {
@@ -138,6 +141,10 @@ static void serverWriteCallback(struct bufferevent *bev, void *ctx)
             if(wb->totalLen > wb->writedLen) {
                 return;
             }
+
+            //写完了进行资源回收
+            free(wb->data);
+            wb->data = NULL;
         }
 
         //读取新消息写
@@ -155,6 +162,10 @@ static void serverWriteCallback(struct bufferevent *bev, void *ctx)
             listDelNode(dataList, node);
             continue;
         }
+        //no message return
+        simplog.writeLog(SIMPLOG_DEBUG, "no more message return %s", __func__);
+        bufferevent_free(bev);
+        poolSocket->count -= 1;
         return;
     } while(1);
 
@@ -187,10 +198,19 @@ eventcb2(struct bufferevent *bev, short what, void *ctx)
             wb->data = NULL;
         };
         free(wb);
-		poolSocket->count--;
+		poolSocket->count -= 1;
     } else if(what & BEV_EVENT_CONNECTED) {
         simplog.writeLog(SIMPLOG_DEBUG, "server socket connected");
         serverWriteCallback(bev, ctx);
+    } else if(what & (BEV_EVENT_READING | BEV_EVENT_WRITING)) {
+        simplog.writeLog(SIMPLOG_DEBUG, "server socket write/read error");
+        bufferevent_free(bev);
+        if(wb->data && wb->writedLen < wb->totalLen) {
+            listAddNodeHead(dataList, wb->data);
+            wb->data = NULL;
+        };
+        free(wb);
+        poolSocket->count -= 1;
     } else if(what & BEV_EVENT_TIMEOUT) {
         simplog.writeLog(SIMPLOG_DEBUG, "server socket timeout");
 		bufferevent_free(bev);
@@ -199,7 +219,7 @@ eventcb2(struct bufferevent *bev, short what, void *ctx)
 			wb->data = NULL;
 		};
         free(wb);
-        poolSocket->count--;
+        poolSocket->count -= 1;
     }
 }
 
@@ -237,7 +257,7 @@ syntax(void)
 	fputs("Syntax:\n", stderr);
 	fprintf(stderr, "   %s [-cert certificate_chain_file -key private_key_file] <listen-on-addr> <connect-to-addr>\n", program_name);
 	fputs("Example:\n", stderr);
-	fprintf(stderr, "   %s -d -cert cer.pem -key private.key 0.0.0.0:8443 17.188.137.190:2195\n", program_name);
+	fprintf(stderr, "   %s -d -server-connect-max 100 -cert cer.pem -key private.key 0.0.0.0:8443 17.188.137.190:2195\n", program_name);
 
 	exit(1);
 }
@@ -257,14 +277,14 @@ accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
     resetRequest(r);
 
 	bufferevent_setcb(b_in, clientReadCallback, NULL, eventcb, r);
-
-
 	bufferevent_enable(b_in, EV_READ|EV_WRITE);
 
+    //打印服务器端连接情况
+    simplog.writeLog(SIMPLOG_DEBUG, "server pool max: %d, current count: %d", poolSocket->max, poolSocket->count);
 
     //检查初始化服务器端连接池, 当前连接小于最大连接的时候就创建连接
     if(poolSocket->count < poolSocket->max) {
-		poolSocket->count++;
+		poolSocket->count += 1;
 
         b_out = bufferevent_openssl_socket_new(base, -1, ssl,
                                                BUFFEREVENT_SSL_CONNECTING,
@@ -272,7 +292,7 @@ accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
 
         if (bufferevent_socket_connect(b_out,
                                        (struct sockaddr*)&connect_to_addr, connect_to_addrlen)<0) {
-            perror("bufferevent_socket_connect");
+            simplog.writeLog(SIMPLOG_DEBUG, "bufferevent_socket_connect");
             bufferevent_free(b_out);
             return;
         }
@@ -396,7 +416,7 @@ main(int argc, char **argv)
 {
 	int i;
 	int socklen;
-    int daemon = 0;
+    int daemon = 0, server_max_connect = 1;
 	const char *certificate_chain_file = NULL;
 	const char *private_key_file = NULL;
 
@@ -410,7 +430,12 @@ main(int argc, char **argv)
 		syntax();
 
 	for (i=1; i < argc; ++i) {
-        if (!strcmp(argv[i], "-d")) {
+        if (!strcmp(argv[i], "-server-connect-max")) {
+            if (i + 1 >= argc) {
+                syntax();
+            }
+            server_max_connect = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-d")) {
             //守护进程方式运行
             daemon = 1;
             simplog.writeLog(SIMPLOG_DEBUG, "arg daemon");
@@ -444,7 +469,7 @@ main(int argc, char **argv)
     //init pool sockets
     poolSocket = malloc(sizeof(poolSockets));
     poolSocket->count = 0;
-    poolSocket->max = 100;
+    poolSocket->max = server_max_connect;
 
 	memset(&listen_on_addr, 0, sizeof(listen_on_addr));
 	socklen = sizeof(listen_on_addr);
