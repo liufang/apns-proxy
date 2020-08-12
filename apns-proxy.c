@@ -22,6 +22,10 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <syslog.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -54,10 +58,6 @@ static poolSockets* poolSocket;
 
 static SSL_CTX *ssl_ctx = NULL;
 
-#define MAX_OUTPUT (512*1024)
-
-//static void clientReadCallback(struct bufferevent *bev, void *ctx);
-static void drained_writecb(struct bufferevent *bev, void *ctx);
 static void eventcb(struct bufferevent *bev, short what, void *ctx);
 static void serverWriteCallback(struct bufferevent *bev, void *ctx);
 
@@ -107,33 +107,6 @@ clientReadCallback(struct bufferevent *bev, void *ctx)
     } while(1);
 }
 
-static void
-readcb(struct bufferevent *bev, void *ctx)
-{
-	struct bufferevent *partner = ctx;
-	struct evbuffer *src, *dst;
-	size_t len;
-	src = bufferevent_get_input(bev);
-	len = evbuffer_get_length(src);
-	if (!partner) {
-		evbuffer_drain(src, len);
-		return;
-	}
-	dst = bufferevent_get_output(partner);
-	evbuffer_add_buffer(dst, src);
-
-	if (evbuffer_get_length(dst) >= MAX_OUTPUT) {
-		/* We're giving the other side data faster than it can
-		 * pass it on.  Stop reading here until we have drained the
-		 * other side to MAX_OUTPUT/2 bytes. */
-		bufferevent_setcb(partner, readcb, drained_writecb,
-		    eventcb, bev);
-		bufferevent_setwatermark(partner, EV_WRITE, MAX_OUTPUT/2,
-		    MAX_OUTPUT);
-		bufferevent_disable(bev, EV_READ);
-	}
-}
-
 /**
  * 写回调
  *
@@ -171,6 +144,7 @@ static void serverWriteCallback(struct bufferevent *bev, void *ctx)
         if ((node = listNext(iter)) != NULL) {
             tmp = (char*)node->value;
             dataLen = 37 + (uint16_t)(tmp[35] <<8 | tmp[36]);
+            simplog.writeLog(SIMPLOG_INFO, "send message len %ld", dataLen);
             //free
             if(wb->data) free(wb->data);
             //从队列弹出数据到写缓存上下文
@@ -184,19 +158,6 @@ static void serverWriteCallback(struct bufferevent *bev, void *ctx)
         return;
     } while(1);
 
-}
-
-static void
-drained_writecb(struct bufferevent *bev, void *ctx)
-{
-	struct bufferevent *partner = ctx;
-
-	/* We were choking the other side until we drained our outbuf a bit.
-	 * Now it seems drained. */
-	bufferevent_setcb(bev, readcb, NULL, eventcb, partner);
-	bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
-	if (partner)
-		bufferevent_enable(partner, EV_READ);
 }
 
 //服务器端错误回调
@@ -214,23 +175,31 @@ eventcb2(struct bufferevent *bev, short what, void *ctx)
                         ERR_lib_error_string(err);
                 const char *func = (const char*)
                         ERR_func_error_string(err);
-                fprintf(stderr,
+                simplog.writeLog(SIMPLOG_DEBUG,
                         "%s in %s %s\n", msg, lib, func);
             }
             if (errno)
                 perror("connection error");
         }
         bufferevent_free(bev);
-        if(wb->data) {
+        if(wb->data && wb->writedLen < wb->totalLen) {
             listAddNodeHead(dataList, wb->data);
             wb->data = NULL;
         };
         free(wb);
 		poolSocket->count--;
     } else if(what & BEV_EVENT_CONNECTED) {
+        simplog.writeLog(SIMPLOG_DEBUG, "server socket connected");
         serverWriteCallback(bev, ctx);
     } else if(what & BEV_EVENT_TIMEOUT) {
-        //TODO 写超时
+        simplog.writeLog(SIMPLOG_DEBUG, "server socket timeout");
+		bufferevent_free(bev);
+		if(wb->data && wb->writedLen < wb->totalLen) {
+			listAddNodeHead(dataList, wb->data);
+			wb->data = NULL;
+		};
+        free(wb);
+        poolSocket->count--;
     }
 }
 
@@ -394,6 +363,34 @@ int init_daemon(void)
 	return 0;
 }
 
+//写入pid file
+int write_pid_file(const char *pidfile)
+{
+    int pidfd = 0;
+    char val[16];
+    int len = snprintf(val, sizeof(val), "%"PRIuMAX"\n", (uintmax_t)getpid());
+    if(len<0) {
+        simplog.writeLog(SIMPLOG_ERROR, "pid error (%s)", strerror(errno));
+        return -1;
+    }
+
+    pidfd = open(pidfile,  O_CREAT | O_TRUNC | O_NOFOLLOW | O_WRONLY, 0644);
+    if(pidfd < 0) {
+        simplog.writeLog(SIMPLOG_ERROR, "unable to set pidfile '%s': %s", pidfile, strerror(errno));
+        return -1;
+    }
+
+    size_t r = write(pidfd, val, (unsigned int)len);
+    if(r == -1 || r != len) {
+        simplog.writeLog(SIMPLOG_ERROR, "unable to write pidfile '%s': %s", pidfile, strerror(errno));
+        close(pidfd);
+        return -1;
+    }
+
+    close(pidfd);
+    return(0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -416,6 +413,7 @@ main(int argc, char **argv)
         if (!strcmp(argv[i], "-d")) {
             //守护进程方式运行
             daemon = 1;
+            simplog.writeLog(SIMPLOG_DEBUG, "arg daemon");
         } else if (!strcmp(argv[i], "-cert")) {
 			if (i + 1 >= argc) {
 				syntax();
@@ -439,13 +437,14 @@ main(int argc, char **argv)
     if(daemon) {
         init_daemon();
     }
+    write_pid_file("apns-proxy.pid");
 
     //init data list
     dataList = listCreate();
     //init pool sockets
     poolSocket = malloc(sizeof(poolSockets));
     poolSocket->count = 0;
-    poolSocket->max = 10;
+    poolSocket->max = 100;
 
 	memset(&listen_on_addr, 0, sizeof(listen_on_addr));
 	socklen = sizeof(listen_on_addr);
@@ -470,7 +469,7 @@ main(int argc, char **argv)
 
 	base = event_base_new();
 	if (!base) {
-		perror("event_base_new()");
+        simplog.writeLog(SIMPLOG_ERROR, "create event base error");
 		return 1;
 	}
 
@@ -483,7 +482,7 @@ main(int argc, char **argv)
 	    -1, (struct sockaddr*)&listen_on_addr, socklen);
 
 	if (! listener) {
-		fprintf(stderr, "Couldn't open listener.\n");
+		simplog.writeLog(SIMPLOG_ERROR, "Couldn't open listener.");
 		event_base_free(base);
 		return 1;
 	}

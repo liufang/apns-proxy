@@ -35,3 +35,6 @@
 apns-proxy
 .idea/
 cmake-build-debug/
+
+apns-proxy.pid
+default.log
